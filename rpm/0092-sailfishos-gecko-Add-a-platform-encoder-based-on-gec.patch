@@ -1,0 +1,887 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Denis Grigorev <d.grigorev@omprussia.ru>
+Date: Thu, 24 Feb 2022 13:02:52 +0300
+Subject: [PATCH] [sailfishos][gecko] Add a platform encoder based on
+ gecko-camera. JB#57632
+
+---
+ dom/media/platforms/PEMFactory.cpp            |   7 +
+ .../gecko-camera/GeckoCameraEncoderModule.cpp |  52 ++++
+ .../gecko-camera/GeckoCameraEncoderModule.h   |  31 ++
+ .../gecko-camera/GeckoCameraVideoEncoder.cpp  | 286 ++++++++++++++++++
+ .../gecko-camera/GeckoCameraVideoEncoder.h    |  92 ++++++
+ dom/media/platforms/moz.build                 |   6 +
+ .../src/media-conduit/MediaDataCodec.cpp      |  13 +-
+ .../src/media-conduit/WebrtcGmpVideoCodec.h   |   1 +
+ .../WebrtcMediaDataEncoderCodec.cpp           | 198 ++++++++----
+ .../WebrtcMediaDataEncoderCodec.h             |   6 +
+ modules/libpref/init/StaticPrefList.yaml      |   2 +-
+ 11 files changed, 638 insertions(+), 56 deletions(-)
+ create mode 100644 dom/media/platforms/gecko-camera/GeckoCameraEncoderModule.cpp
+ create mode 100644 dom/media/platforms/gecko-camera/GeckoCameraEncoderModule.h
+ create mode 100644 dom/media/platforms/gecko-camera/GeckoCameraVideoEncoder.cpp
+ create mode 100644 dom/media/platforms/gecko-camera/GeckoCameraVideoEncoder.h
+
+diff --git a/dom/media/platforms/PEMFactory.cpp b/dom/media/platforms/PEMFactory.cpp
+index 6dde69bf6082..744e17e468ab 100644
+--- a/dom/media/platforms/PEMFactory.cpp
++++ b/dom/media/platforms/PEMFactory.cpp
+@@ -12,6 +12,10 @@
+ #ifdef MOZ_WIDGET_ANDROID
+ #  include "AndroidEncoderModule.h"
+ #endif
++#ifdef MOZ_EMBEDLITE
++#  include "GeckoCameraEncoderModule.h"
++#endif
++
+ 
+ namespace mozilla {
+ 
+@@ -25,6 +29,9 @@ PEMFactory::PEMFactory() {
+ #ifdef MOZ_WIDGET_ANDROID
+   mModules.AppendElement(new AndroidEncoderModule());
+ #endif
++#ifdef MOZ_EMBEDLITE
++  mModules.AppendElement(new GeckoCameraEncoderModule());
++#endif
+ }
+ 
+ bool PEMFactory::SupportsMimeType(const nsACString& aMimeType) const {
+diff --git a/dom/media/platforms/gecko-camera/GeckoCameraEncoderModule.cpp b/dom/media/platforms/gecko-camera/GeckoCameraEncoderModule.cpp
+new file mode 100644
+index 000000000000..84b195da9b8b
+--- /dev/null
++++ b/dom/media/platforms/gecko-camera/GeckoCameraEncoderModule.cpp
+@@ -0,0 +1,52 @@
++/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "GeckoCameraEncoderModule.h"
++#include "GeckoCameraVideoEncoder.h"
++//#include "mozilla/Logging.h"
++
++namespace mozilla {
++
++extern LazyLogModule sPEMLog;
++
++#define VENC_LOGD(arg, ...)                \
++  MOZ_LOG(sPEMLog, mozilla::LogLevel::Debug, \
++          ("GeckoCameraVideoEncoder(%p)::%s: " arg, this, __func__, ##__VA_ARGS__))
++
++bool GeckoCameraEncoderModule::sInitialized = false;
++gecko::codec::CodecManager* GeckoCameraEncoderModule::sCodecManager = nullptr;
++
++void GeckoCameraEncoderModule::Init() {
++  MOZ_LOG(sPEMLog, mozilla::LogLevel::Debug, ("Init: %d %p\n", sInitialized, sCodecManager));
++  if (sInitialized) {
++    return;
++  }
++  sCodecManager = gecko_codec_manager();
++  if (sCodecManager) {
++    sInitialized = sCodecManager->init();
++  }
++}
++
++already_AddRefed<MediaDataEncoder> GeckoCameraEncoderModule::CreateVideoEncoder(
++    const CreateEncoderParams& aParams) const {
++  Init();
++  VENC_LOGD("CreateVideoEncoder: %d %p\n", sInitialized, sCodecManager);
++  if (sInitialized && sCodecManager) {
++    RefPtr<MediaDataEncoder> encoder =
++      new GeckoCameraVideoEncoder(sCodecManager, aParams);
++    return encoder.forget();
++  }
++  return nullptr;
++}
++
++bool GeckoCameraEncoderModule::SupportsMimeType(const nsACString& aMimeType) const {
++  Init();
++  VENC_LOGD("SupportsMimeType: %d %p\n", sInitialized, sCodecManager);
++  return (sInitialized && sCodecManager
++          && sCodecManager->videoEncoderAvailable(
++            GeckoCameraVideoEncoder::CodecTypeFromMime(aMimeType)));
++}
++
++}  // namespace mozilla
+diff --git a/dom/media/platforms/gecko-camera/GeckoCameraEncoderModule.h b/dom/media/platforms/gecko-camera/GeckoCameraEncoderModule.h
+new file mode 100644
+index 000000000000..3bb8cef50bf2
+--- /dev/null
++++ b/dom/media/platforms/gecko-camera/GeckoCameraEncoderModule.h
+@@ -0,0 +1,31 @@
++/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef DOM_MEDIA_PLATFORMS_GECKO_CAMERA_GECKOCAMERAENCODERMODULE_H_
++#define DOM_MEDIA_PLATFORMS_GECKO_CAMERA_GECKOCAMERAENCODERMODULE_H_
++
++#include <geckocamera-codec.h>
++
++#include "PlatformEncoderModule.h"
++
++namespace mozilla {
++
++class GeckoCameraEncoderModule final : public PlatformEncoderModule {
++ public:
++  bool SupportsMimeType(const nsACString& aMimeType) const override;
++
++  already_AddRefed<MediaDataEncoder> CreateVideoEncoder(
++      const CreateEncoderParams& aParams) const override;
++
++  static void Init();
++
++ private:
++  static bool sInitialized;
++  static gecko::codec::CodecManager* sCodecManager;
++};
++
++} // namespace mozilla
++
++#endif
+diff --git a/dom/media/platforms/gecko-camera/GeckoCameraVideoEncoder.cpp b/dom/media/platforms/gecko-camera/GeckoCameraVideoEncoder.cpp
+new file mode 100644
+index 000000000000..9d290d48354b
+--- /dev/null
++++ b/dom/media/platforms/gecko-camera/GeckoCameraVideoEncoder.cpp
+@@ -0,0 +1,286 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "GeckoCameraVideoEncoder.h"
++
++#include "ImageContainer.h"
++#include "mozilla/Logging.h"
++
++#include "nsMimeTypes.h"
++
++#include "VideoUtils.h"
++#include "libyuv.h"
++
++namespace mozilla {
++
++extern LazyLogModule sPEMLog;
++#define VENC_LOGD(arg, ...)                \
++  MOZ_LOG(sPEMLog, mozilla::LogLevel::Debug, \
++          ("GeckoCameraVideoEncoder(%p)::%s: " arg, this, __func__, ##__VA_ARGS__))
++#define VENC_LOGE(arg, ...)               \
++  MOZ_LOG(sPEMLog, mozilla::LogLevel::Error, \
++          ("GeckoCameraVideoEncoder(%p)::%s: " arg, this, __func__, ##__VA_ARGS__))
++
++GeckoCameraVideoEncoder::GeckoCameraVideoEncoder(
++    gecko::codec::CodecManager* manager,
++    const CreateEncoderParams& aParams)
++    : mCodecManager(manager),
++      mParams(aParams),
++      mTaskQueue(aParams.mTaskQueue) {
++  MOZ_COUNT_CTOR(GeckoCameraVideoEncoder);
++}
++
++GeckoCameraVideoEncoder::~GeckoCameraVideoEncoder() {
++  MOZ_COUNT_DTOR(GeckoCameraVideoEncoder);
++}
++
++RefPtr<MediaDataEncoder::InitPromise> GeckoCameraVideoEncoder::Init() {
++  return InvokeAsync(mTaskQueue, this, __func__,
++                     &GeckoCameraVideoEncoder::ProcessInit);
++}
++
++gecko::codec::CodecType GeckoCameraVideoEncoder::CodecTypeFromMime(
++    const nsACString& aMimeType) {
++  if (MP4Decoder::IsH264(aMimeType)) {
++    return gecko::codec::VideoCodecH264;
++  } else if (VPXDecoder::IsVP8(aMimeType)) {
++    return gecko::codec::VideoCodecVP8;
++  } else if (VPXDecoder::IsVP9(aMimeType)) {
++    return gecko::codec::VideoCodecVP9;
++  }
++  return gecko::codec::VideoCodecUnknown;
++}
++
++gecko::codec::CodecType GeckoCameraVideoEncoder::CodecType(
++    MediaDataEncoder::CodecType aCodec) {
++  switch (aCodec) {
++    case MediaDataEncoder::CodecType::H264:
++      return gecko::codec::VideoCodecH264;
++    case MediaDataEncoder::CodecType::VP8:
++      return gecko::codec::VideoCodecVP8;
++    case MediaDataEncoder::CodecType::VP9:
++      return gecko::codec::VideoCodecVP9;
++    default:
++      return gecko::codec::VideoCodecUnknown;
++  };
++}
++
++RefPtr<MediaDataEncoder::InitPromise> GeckoCameraVideoEncoder::ProcessInit() {
++  gecko::codec::VideoEncoderMetadata metadata;
++  memset(&metadata, 0, sizeof(metadata));
++
++  metadata.codecType = CodecTypeFromMime(mParams.mConfig.mMimeType);
++
++  const VideoInfo *info = mParams.mConfig.GetAsVideoInfo();
++  MOZ_ASSERT(info);
++
++  metadata.width = info->mImage.width;
++  metadata.height = info->mImage.height;
++  metadata.stride = info->mImage.width;
++  metadata.sliceHeight = info->mImage.height;
++  metadata.framerate = mParams.mFramerate;
++  metadata.bitrate = mParams.mBitrate;
++
++  if (metadata.codecType == gecko::codec::VideoCodecH264
++      && mParams.mUsage != Usage::Realtime) {
++    return InitPromise::CreateAndReject(
++        MediaResult(NS_ERROR_DOM_MEDIA_FATAL_ERR,
++                    RESULT_DETAIL("Non realtime encoding is not supported.")),
++                                  __func__);
++  }
++
++  if (!mCodecManager->createVideoEncoder(metadata.codecType, mEncoder)) {
++    VENC_LOGE("Cannot create decoder");
++    return InitPromise::CreateAndReject(
++        MediaResult(NS_ERROR_DOM_MEDIA_FATAL_ERR,
++                    RESULT_DETAIL("Create decoder failed")), __func__);
++  }
++
++  if (!mEncoder->init(metadata)) {
++    return InitPromise::CreateAndReject(
++        MediaResult(NS_ERROR_DOM_MEDIA_FATAL_ERR,
++                    RESULT_DETAIL("Init decoder failed")), __func__);
++  }
++
++  mEncoder->setListener(this);
++  return InitPromise::CreateAndResolve(TrackInfo::kVideoTrack, __func__);
++}
++
++RefPtr<ShutdownPromise> GeckoCameraVideoEncoder::Shutdown() {
++  return InvokeAsync(mTaskQueue, this, __func__,
++                     &GeckoCameraVideoEncoder::ProcessShutdown);
++}
++
++RefPtr<ShutdownPromise> GeckoCameraVideoEncoder::ProcessShutdown() {
++  AssertOnTaskQueue();
++  VENC_LOGD("Shutdown");
++  mEncoder.reset();
++  return ShutdownPromise::CreateAndResolve(true, __func__);
++}
++
++RefPtr<MediaDataEncoder::EncodePromise> GeckoCameraVideoEncoder::Encode(
++    const MediaData* aSample) {
++  RefPtr<GeckoCameraVideoEncoder> self = this;
++  MOZ_ASSERT(aSample != nullptr);
++
++  RefPtr<const MediaData> sample(aSample);
++  return InvokeAsync(mTaskQueue, __func__, [self, sample]() {
++    return self->ProcessEncode(std::move(sample));
++  });
++}
++
++class GeckoCameraInputFrame : public gecko::camera::YCbCrFrame {
++public:
++  static std::shared_ptr<gecko::camera::YCbCrFrame> create(RefPtr<const MediaData> aSample) {
++    return std::make_shared<GeckoCameraInputFrame>(aSample);
++  }
++
++  GeckoCameraInputFrame(RefPtr<const MediaData> aSample) : mSample(aSample) {
++    const VideoData *videoData = aSample->As<VideoData>();
++    MOZ_ASSERT(videoData);
++    const layers::PlanarYCbCrImage* image = videoData->mImage->AsPlanarYCbCrImage();
++    MOZ_ASSERT(image);
++    const layers::PlanarYCbCrData* yuv = image->GetData();
++
++    y = yuv->mYChannel;
++    cb = yuv->mCbChannel;
++    cr = yuv->mCrChannel;
++    yStride = yuv->mYStride;
++    cStride = yuv->mCbCrStride;
++    width = yuv->mPicSize.width;
++    height = yuv->mPicSize.height;
++    chromaStep = 1;
++    timestampUs = aSample->mTime.ToMicroseconds();
++    VENC_LOGD("Created input frame timestampMs=%lld", timestampUs);
++  }
++
++  ~GeckoCameraInputFrame() {
++    VENC_LOGD("Destroyed input frame timestampMs=%lld", timestampUs);
++  }
++
++private:
++  RefPtr<const MediaData> mSample;
++};
++
++RefPtr<MediaDataEncoder::EncodePromise> GeckoCameraVideoEncoder::ProcessEncode(
++    RefPtr<const MediaData> aSample) {
++  AssertOnTaskQueue();
++
++  if (mError) {
++    auto error = mError.value();
++    mError.reset();
++    return EncodePromise::CreateAndReject(std::move(error), __func__);
++  }
++
++  auto yCbCrFrame = GeckoCameraInputFrame::create(aSample);
++  if (!mEncoder->encode(yCbCrFrame, aSample->mKeyframe)) {
++    VENC_LOGE("Couldn't encode the frame");
++  }
++
++  if (mEncodedData.Length() > 0) {
++    EncodedData pending;
++    pending.SwapElements(mEncodedData);
++    return EncodePromise::CreateAndResolve(std::move(pending), __func__);
++  } else {
++    return EncodePromise::CreateAndResolve(EncodedData(), __func__);
++  }
++}
++
++void GeckoCameraVideoEncoder::ProcessOutput(
++    uint8_t *data,
++    size_t size,
++    uint64_t timestampUs,
++    gecko::codec::FrameType frameType) {
++  VENC_LOGD("ProcessOutput timestampUs=%lld", timestampUs);
++  auto output = MakeRefPtr<MediaRawData>();
++
++  UniquePtr<MediaRawDataWriter> writer(output->CreateWriter());
++  if (!writer->SetSize(size)) {
++    VENC_LOGE("Couldn't allocate output buffer");
++    return;
++  }
++
++  PodCopy(writer->Data(), data, size);
++  output->mKeyframe = frameType == gecko::codec::FrameType::KeyFrame;
++  output->mTime = media::TimeUnit::FromMicroseconds(timestampUs);
++  mEncodedData.AppendElement(std::move(output));
++}
++
++RefPtr<MediaDataEncoder::EncodePromise> GeckoCameraVideoEncoder::Drain() {
++  return InvokeAsync(mTaskQueue, this, __func__,
++                     &GeckoCameraVideoEncoder::ProcessDrain);
++}
++
++RefPtr<MediaDataEncoder::EncodePromise> GeckoCameraVideoEncoder::ProcessDrain() {
++  AssertOnTaskQueue();
++  MOZ_ASSERT(mDrainPromise.IsEmpty());
++
++  switch (mDrainState) {
++    case DrainState::DRAINABLE:
++      mEncoder.reset();
++      mDrainState = DrainState::DRAINING;
++      [[fallthrough]];
++    case DrainState::DRAINING:
++      if (mEncodedData.IsEmpty()) {
++        return mDrainPromise.Ensure(__func__);
++      }
++      [[fallthrough]];
++    case DrainState::DRAINED:
++      if (mEncodedData.Length() > 0) {
++        EncodedData pending;
++        pending.SwapElements(mEncodedData);
++        return EncodePromise::CreateAndResolve(std::move(pending), __func__);
++      }
++  }
++  return EncodePromise::CreateAndResolve(EncodedData(), __func__);
++}
++
++RefPtr<GenericPromise> GeckoCameraVideoEncoder::SetBitrate(
++    const MediaDataEncoder::Rate aBitsPerSec) {
++  RefPtr<GeckoCameraVideoEncoder> self(this);
++  return InvokeAsync(mTaskQueue, __func__, [self, aBitsPerSec]() {
++    self->mEncoder->setBitrate(aBitsPerSec);
++    return GenericPromise::CreateAndResolve(true, __func__);
++  });
++
++  return nullptr;
++}
++
++void GeckoCameraVideoEncoder::Error(const MediaResult& aError) {
++  if (!mTaskQueue->IsCurrentThreadIn()) {
++    nsresult rv = mTaskQueue->Dispatch(NewRunnableMethod<MediaResult>(
++        "GeckoCameraVideoEncoder::Error", this, &GeckoCameraVideoEncoder::Error, aError));
++    MOZ_DIAGNOSTIC_ASSERT(NS_SUCCEEDED(rv));
++    Unused << rv;
++    return;
++  }
++  AssertOnTaskQueue();
++  mError.emplace(aError);
++}
++
++void GeckoCameraVideoEncoder::onEncodedFrame(
++    uint8_t *data,
++    size_t size,
++    uint64_t timestampUs,
++    gecko::codec::FrameType frameType) {
++  ProcessOutput(data, size, timestampUs, frameType);
++}
++
++void GeckoCameraVideoEncoder::onEncoderError(
++    std::string errorDescription) {
++  MediaResult result(NS_ERROR_DOM_MEDIA_FATAL_ERR,
++                     RESULT_DETAIL("%s", errorDescription.c_str()));
++  Error(result);
++}
++
++void GeckoCameraVideoEncoder::onEncoderEOS() {
++  mDrainState = DrainState::DRAINED;
++  if (!mDrainPromise.IsEmpty()) {
++    EncodedData pending;
++    pending.SwapElements(mEncodedData);
++    mDrainPromise.Resolve(std::move(pending), __func__);
++  }
++}
++
++}  // namespace mozilla
+diff --git a/dom/media/platforms/gecko-camera/GeckoCameraVideoEncoder.h b/dom/media/platforms/gecko-camera/GeckoCameraVideoEncoder.h
+new file mode 100644
+index 000000000000..7da6b68ecafe
+--- /dev/null
++++ b/dom/media/platforms/gecko-camera/GeckoCameraVideoEncoder.h
+@@ -0,0 +1,92 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef DOM_MEDIA_PLATFORMS_GECKO_CAMERA_GECKOCAMERAVIDEOENCODER_H_
++#define DOM_MEDIA_PLATFORMS_GECKO_CAMERA_GECKOCAMERAVIDEOENCODER_H_
++
++#include <geckocamera-codec.h>
++
++#include "MediaData.h"
++#include "PlatformEncoderModule.h"
++#include "TimeUnits.h"
++
++#include "mozilla/Maybe.h"
++#include "mozilla/Monitor.h"
++
++namespace mozilla {
++
++class GeckoCameraVideoEncoder final
++  : public MediaDataEncoder,
++    public gecko::codec::VideoEncoderListener {
++ public:
++  GeckoCameraVideoEncoder(gecko::codec::CodecManager* manager,
++      const CreateEncoderParams& aParams);
++  ~GeckoCameraVideoEncoder();
++  RefPtr<InitPromise> Init() override;
++  RefPtr<EncodePromise> Encode(const MediaData* aSample) override;
++  RefPtr<EncodePromise> Drain() override;
++  RefPtr<ShutdownPromise> Shutdown() override;
++  RefPtr<GenericPromise> SetBitrate(const Rate aBitsPerSec) override;
++
++  nsCString GetDescriptionName() const override {
++    return NS_LITERAL_CSTRING("gecko-camera video encoder");
++  }
++
++  virtual bool IsHardwareAccelerated(nsACString& aFailureReason) const override {
++    return true;
++  }
++
++  virtual void onEncodedFrame(uint8_t *data,
++                              size_t size,
++                              uint64_t timestampUs,
++                              gecko::codec::FrameType frameType) override;
++
++  virtual void onEncoderError(std::string errorDescription) override;
++  virtual void onEncoderEOS() override;
++
++  static gecko::codec::CodecType CodecTypeFromMime(const nsACString& aMimeType);
++
++ private:
++   // Methods only called on mTaskQueue.
++  RefPtr<InitPromise> ProcessInit();
++  RefPtr<EncodePromise> ProcessEncode(RefPtr<const MediaData> aSample);
++  RefPtr<EncodePromise> ProcessDrain();
++  RefPtr<ShutdownPromise> ProcessShutdown();
++  void ProcessInput();
++  void ProcessOutput(uint8_t *data, size_t size, uint64_t timestampUs,
++                     gecko::codec::FrameType frameType);
++  void Error(const MediaResult& aError);
++
++  void AssertOnTaskQueue() const {
++    MOZ_ASSERT(mTaskQueue->IsCurrentThreadIn());
++  }
++
++  std::shared_ptr<gecko::codec::VideoEncoder> mEncoder;
++
++  gecko::codec::CodecType CodecType(MediaDataEncoder::CodecType aCodec);
++
++  gecko::codec::CodecManager* mCodecManager;
++  const CreateEncoderParams mParams;
++  RefPtr<TaskQueue> mTaskQueue;
++  const VideoInfo mInfo;
++
++  //java::sdk::BufferInfo::GlobalRef mInputBufferInfo;
++
++  MozPromiseHolder<EncodePromise> mDrainPromise;
++
++  // Accessed on mTaskqueue only.
++  RefPtr<MediaByteBuffer> mYUVBuffer;
++  EncodedData mEncodedData;
++  //// SPS/PPS NALUs for realtime usage, avcC otherwise.
++  //RefPtr<MediaByteBuffer> mConfigData;
++
++  enum class DrainState { DRAINED, DRAINABLE, DRAINING };
++  DrainState mDrainState;
++
++  Maybe<MediaResult> mError;
++};
++
++}  // namespace mozilla
++
++#endif
+diff --git a/dom/media/platforms/moz.build b/dom/media/platforms/moz.build
+index 38754ae190a0..d5fbed8c0e2d 100644
+--- a/dom/media/platforms/moz.build
++++ b/dom/media/platforms/moz.build
+@@ -132,13 +132,19 @@ if CONFIG['MOZ_WIDGET_TOOLKIT'] == 'android':
+ if CONFIG['MOZ_ENABLE_WEBRTC_GECKOCAMERA']:
+     EXPORTS += [
+         'gecko-camera/GeckoCameraDecoderModule.h',
++        'gecko-camera/GeckoCameraEncoderModule.h',
+     ]
+     UNIFIED_SOURCES += [
+         'gecko-camera/GeckoCameraDecoderModule.cpp',
++        'gecko-camera/GeckoCameraEncoderModule.cpp',
+         'gecko-camera/GeckoCameraVideoDecoder.cpp',
++        'gecko-camera/GeckoCameraVideoEncoder.cpp',
+     ]
+     OS_LIBS += CONFIG["LIBGECKOCAMERA_LIBS"]
+     CXXFLAGS += CONFIG["LIBGECKOCAMERA_CFLAGS"]
++    LOCAL_INCLUDES += [
++        '/media/libyuv/libyuv/include',
++    ]
+ 
+ FINAL_LIBRARY = 'xul'
+ 
+diff --git a/media/webrtc/signaling/src/media-conduit/MediaDataCodec.cpp b/media/webrtc/signaling/src/media-conduit/MediaDataCodec.cpp
+index 714b9f1bd01b..fa9e24991fc0 100644
+--- a/media/webrtc/signaling/src/media-conduit/MediaDataCodec.cpp
++++ b/media/webrtc/signaling/src/media-conduit/MediaDataCodec.cpp
+@@ -6,6 +6,7 @@
+ #include "WebrtcMediaDataDecoderCodec.h"
+ #include "WebrtcMediaDataEncoderCodec.h"
+ #include "WebrtcGmpVideoCodec.h"
++#include "PEMFactory.h"
+ #include "mozilla/StaticPrefs_media.h"
+ 
+ namespace mozilla {
+@@ -13,8 +14,16 @@ namespace mozilla {
+ /* static */
+ WebrtcVideoEncoder* MediaDataCodec::CreateEncoder(
+     webrtc::VideoCodecType aCodecType) {
+-#if defined(MOZ_APPLEMEDIA) || defined(MOZ_WIDGET_ANDROID)
+-  if (aCodecType == webrtc::VideoCodecType::kVideoCodecH264) {
++#if defined(MOZ_APPLEMEDIA) || defined(MOZ_WIDGET_ANDROID) || defined(MOZ_EMBEDLITE)
++  const RefPtr<PEMFactory> factory = new PEMFactory();
++  nsCString mimeType;
++  switch (aCodecType) {
++    case webrtc::VideoCodecType::kVideoCodecH264:
++      mimeType = NS_LITERAL_CSTRING("video/avc");
++    default:
++      break;
++  }
++  if (!mimeType.IsEmpty() && factory->SupportsMimeType(mimeType)) {
+     return new WebrtcVideoEncoderProxy(new WebrtcMediaDataEncoder());
+   }
+ #endif
+diff --git a/media/webrtc/signaling/src/media-conduit/WebrtcGmpVideoCodec.h b/media/webrtc/signaling/src/media-conduit/WebrtcGmpVideoCodec.h
+index f9e16cce557a..bd79356c6d8d 100644
+--- a/media/webrtc/signaling/src/media-conduit/WebrtcGmpVideoCodec.h
++++ b/media/webrtc/signaling/src/media-conduit/WebrtcGmpVideoCodec.h
+@@ -316,6 +316,7 @@ class WebrtcGmpVideoEncoder : public GMPVideoEncoderCallbackProxy,
+ class WebrtcVideoEncoderProxy : public WebrtcVideoEncoder {
+  public:
+   explicit WebrtcVideoEncoderProxy(webrtc::VideoCodecType aType) : mEncoderImpl(new WebrtcGmpVideoEncoder(aType)) {}
++  explicit WebrtcVideoEncoderProxy(RefCountedWebrtcVideoEncoder* aEncoder) : mEncoderImpl(aEncoder) {}
+   virtual ~WebrtcVideoEncoderProxy() {
+     RegisterEncodeCompleteCallback(nullptr);
+   }
+diff --git a/media/webrtc/signaling/src/media-conduit/WebrtcMediaDataEncoderCodec.cpp b/media/webrtc/signaling/src/media-conduit/WebrtcMediaDataEncoderCodec.cpp
+index 85c6e564bcaa..c6a85056206b 100644
+--- a/media/webrtc/signaling/src/media-conduit/WebrtcMediaDataEncoderCodec.cpp
++++ b/media/webrtc/signaling/src/media-conduit/WebrtcMediaDataEncoderCodec.cpp
+@@ -94,9 +94,6 @@ WebrtcMediaDataEncoder::WebrtcMediaDataEncoder()
+ int32_t WebrtcMediaDataEncoder::InitEncode(
+     const webrtc::VideoCodec* aCodecSettings, int32_t aNumberOfCores,
+     size_t aMaxPayloadSize) {
+-  MOZ_ASSERT(
+-      aCodecSettings->codecType == webrtc::VideoCodecType::kVideoCodecH264,
+-      "Only support h264 for now.");
+ 
+   if (mEncoder) {
+     // Clean existing encoder.
+@@ -127,9 +124,45 @@ bool WebrtcMediaDataEncoder::SetupConfig(
+   }
+   mInfo = VideoInfo(aCodecSettings->width, aCodecSettings->height);
+   mInfo.mMimeType = mimeType.unwrap();
+-  mMode = aCodecSettings->H264().packetizationMode == 1
+-              ? webrtc::H264PacketizationMode::NonInterleaved
+-              : webrtc::H264PacketizationMode::SingleNalUnit;
++  mCodecType = aCodecSettings->codecType;
++  switch (mCodecType) {
++    case webrtc::VideoCodecType::kVideoCodecH264:
++      mMode = aCodecSettings->H264().packetizationMode == 1
++                  ? webrtc::H264PacketizationMode::NonInterleaved
++                  : webrtc::H264PacketizationMode::SingleNalUnit;
++      mCodecSpecific.codecType = webrtc::kVideoCodecH264;
++      mCodecSpecific.codecSpecific.H264.packetization_mode = mMode;
++      break;
++    case webrtc::VideoCodecType::kVideoCodecVP8:
++      mPictureId = static_cast<uint16_t>(rand()) & 0x7fff;
++      mCodecSpecific.codecType = webrtc::kVideoCodecVP8;
++      mCodecSpecific.codecSpecific.VP8.pictureId = mPictureId = 0;
++      mCodecSpecific.codecSpecific.VP8.nonReference = false;
++      mCodecSpecific.codecSpecific.VP8.simulcastIdx = 0;
++      mCodecSpecific.codecSpecific.VP8.temporalIdx = webrtc::kNoTemporalIdx;
++      mCodecSpecific.codecSpecific.VP8.layerSync = false;
++      mCodecSpecific.codecSpecific.VP8.tl0PicIdx = webrtc::kNoTl0PicIdx;
++      mCodecSpecific.codecSpecific.VP8.keyIdx = webrtc::kNoKeyIdx;
++      break;
++    case webrtc::VideoCodecType::kVideoCodecVP9:
++      mGofIdx = 0;
++      mTl0PicIdx = static_cast<uint8_t>(rand());
++      mPictureId = static_cast<uint16_t>(rand());
++      mGof.SetGofInfoVP9(webrtc::TemporalStructureMode::kTemporalStructureMode1);
++      mCodecSpecific.codecType = webrtc::kVideoCodecVP9;
++      mCodecSpecific.codecSpecific.VP9.flexible_mode = false;
++      mCodecSpecific.codecSpecific.VP9.temporal_idx = webrtc::kNoTemporalIdx;
++      mCodecSpecific.codecSpecific.VP9.spatial_idx = webrtc::kNoSpatialIdx;
++      mCodecSpecific.codecSpecific.VP9.temporal_up_switch = true;
++      mCodecSpecific.codecSpecific.VP9.inter_layer_predicted = false;
++      mCodecSpecific.codecSpecific.VP9.num_spatial_layers = 1;
++      mCodecSpecific.codecSpecific.VP9.spatial_layer_resolution_present = false;
++      break;
++    default:
++      MOZ_ASSERT(false, "Unknown video codec");
++      break;
++  }
++
+   mMaxFrameRate = aCodecSettings->maxFramerate;
+   // Those bitrates in codec setting are all kbps, so we have to covert them to
+   // bps.
+@@ -178,34 +211,56 @@ int32_t WebrtcMediaDataEncoder::Shutdown() {
+   return WEBRTC_VIDEO_CODEC_OK;
+ }
+ 
++class WebRtcYCbCrImage final : public PlanarYCbCrImage {
++public:
++  WebRtcYCbCrImage(const webrtc::VideoFrame& aFrame) : mFrame(aFrame) {
++    rtc::scoped_refptr<webrtc::I420BufferInterface> i420 =
++      aFrame.video_frame_buffer()->GetI420();
++
++    PlanarYCbCrData yCbCrData;
++    yCbCrData.mYChannel = const_cast<uint8_t*>(i420->DataY());
++    yCbCrData.mYSize = gfx::IntSize(i420->width(), i420->height());
++    yCbCrData.mYStride = i420->StrideY();
++    yCbCrData.mCbChannel = const_cast<uint8_t*>(i420->DataU());
++    yCbCrData.mCrChannel = const_cast<uint8_t*>(i420->DataV());
++    yCbCrData.mCbCrSize = gfx::IntSize(i420->ChromaWidth(), i420->ChromaHeight());
++    MOZ_ASSERT(i420->StrideU() == i420->StrideV());
++    yCbCrData.mCbCrStride = i420->StrideU();
++    yCbCrData.mPicSize = gfx::IntSize(i420->width(), i420->height());
++
++    // Adopt data instead of copying.
++    AdoptData(yCbCrData);
++  }
++
++  virtual bool CopyData(const Data& aData) override {
++    return false;
++  }
++
++  virtual size_t SizeOfExcludingThis(mozilla::MallocSizeOf aSizeOf) const {
++    return aSizeOf(this);
++  }
++private:
++  const webrtc::VideoFrame mFrame;
++};
++
+ static already_AddRefed<VideoData> CreateVideoDataFromWebrtcVideoFrame(
+     const webrtc::VideoFrame& aFrame, const bool aIsKeyFrame,
+     const TimeUnit aDuration) {
+   MOZ_ASSERT(aFrame.video_frame_buffer()->type() ==
+                  webrtc::VideoFrameBuffer::Type::kI420,
+              "Only support YUV420!");
+-  rtc::scoped_refptr<webrtc::I420BufferInterface> i420 =
+-      aFrame.video_frame_buffer()->GetI420();
+ 
+-  PlanarYCbCrData yCbCrData;
+-  yCbCrData.mYChannel = const_cast<uint8_t*>(i420->DataY());
+-  yCbCrData.mYSize = gfx::IntSize(i420->width(), i420->height());
+-  yCbCrData.mYStride = i420->StrideY();
+-  yCbCrData.mCbChannel = const_cast<uint8_t*>(i420->DataU());
+-  yCbCrData.mCrChannel = const_cast<uint8_t*>(i420->DataV());
+-  yCbCrData.mCbCrSize = gfx::IntSize(i420->ChromaWidth(), i420->ChromaHeight());
+-  MOZ_ASSERT(i420->StrideU() == i420->StrideV());
+-  yCbCrData.mCbCrStride = i420->StrideU();
+-  yCbCrData.mPicSize = gfx::IntSize(i420->width(), i420->height());
+-
+-  RefPtr<PlanarYCbCrImage> image =
+-      new RecyclingPlanarYCbCrImage(new BufferRecycleBin());
+-  image->CopyData(yCbCrData);
+-
+-  return VideoData::CreateFromImage(
+-      image->GetSize(), 0, TimeUnit::FromMicroseconds(aFrame.timestamp_us()),
+-      aDuration, image, aIsKeyFrame,
+-      TimeUnit::FromMicroseconds(aFrame.timestamp()));
++  RefPtr<WebRtcYCbCrImage> image = new WebRtcYCbCrImage(aFrame);
++
++  // Although webrtc::VideoFrame::timestamp_rtp_ will likely be deprecated,
++  // webrtc::EncodedImage and the VPx encoders still use it in the imported
++  // version of libwebrtc. Not using the same timestamp values generates
++  // discontinuous time and confuses the video receiver when switching from
++  // platform to libwebrtc encoder.
++  TimeUnit timestamp =
++      FramesToTimeUnit(aFrame.timestamp(), cricket::kVideoCodecClockrate);
++  return VideoData::CreateFromImage(image->GetSize(), 0, timestamp, aDuration,
++                                    image, aIsKeyFrame, timestamp);
+ }
+ 
+ int32_t WebrtcMediaDataEncoder::Encode(
+@@ -230,6 +285,14 @@ int32_t WebrtcMediaDataEncoder::Encode(
+     }
+   }
+ 
++#ifdef DEBUG
++  TimeUnit timestamp =
++      FramesToTimeUnit(aInputFrame.timestamp(), cricket::kVideoCodecClockrate);
++  LOG_V("Input frame timetamp %lld, %lld, %lld", (uint64_t)aInputFrame.timestamp(),
++              timestamp.ToMicroseconds(),
++              TimeUnitToFrames(timestamp, cricket::kVideoCodecClockrate).value());
++#endif
++
+   LOG_V("Encode frame, type %d size %u", (*aFrameTypes)[0], aInputFrame.size());
+   MOZ_ASSERT(aInputFrame.video_frame_buffer()->type() ==
+              webrtc::VideoFrameBuffer::Type::kI420);
+@@ -253,41 +316,70 @@ int32_t WebrtcMediaDataEncoder::Encode(
+                                      frame->Size(), frame->Size());
+           image._encodedWidth = displaySize.width;
+           image._encodedHeight = displaySize.height;
+-          CheckedInt64 time =
+-              TimeUnitToFrames(frame->mTime, cricket::kVideoCodecClockrate);
+-          if (!time.isValid()) {
+-            self->mError = MediaResult(NS_ERROR_DOM_MEDIA_FATAL_ERR,
+-                                       "invalid timestamp from encoder");
+-            break;
+-          }
+-          image._timeStamp = time.value();
++
++          // The conversion to webrtc frames using TimeUnitToFrames() gives
++          // rounding error. Do it the proper way.
++          image._timeStamp = (frame->mTime.ToMicroseconds() * 90 + 999) / 1000;
++
+           image._frameType = frame->mKeyframe
+                                  ? webrtc::FrameType::kVideoFrameKey
+                                  : webrtc::FrameType::kVideoFrameDelta;
+           image._completeFrame = true;
+ 
+-          nsTArray<AnnexB::NALEntry> entries;
+-          AnnexB::ParseNALEntries(
+-              Span<const uint8_t>(frame->Data(), frame->Size()), entries);
+-          const size_t nalNums = entries.Length();
+-          LOG_V("NAL nums %zu", nalNums);
+-          MOZ_ASSERT(nalNums, "Should have at least 1 NALU in encoded frame!");
+-
+           webrtc::RTPFragmentationHeader header;
+-          header.VerifyAndAllocateFragmentationHeader(nalNums);
+-          for (size_t idx = 0; idx < nalNums; idx++) {
+-            header.fragmentationOffset[idx] = entries[idx].mOffset;
+-            header.fragmentationLength[idx] = entries[idx].mSize;
+-            LOG_V("NAL offset %" PRId64 " size %" PRId64, entries[idx].mOffset,
+-                  entries[idx].mSize);
++          switch (mCodecType) {
++            case webrtc::VideoCodecType::kVideoCodecH264: {
++              nsTArray<AnnexB::NALEntry> entries;
++              AnnexB::ParseNALEntries(
++                  Span<const uint8_t>(frame->Data(), frame->Size()), entries);
++              const size_t nalNums = entries.Length();
++              LOG_V("NAL nums %zu", nalNums);
++              MOZ_ASSERT(nalNums, "Should have at least 1 NALU in encoded frame!");
++
++              header.VerifyAndAllocateFragmentationHeader(nalNums);
++              for (size_t idx = 0; idx < nalNums; idx++) {
++                header.fragmentationOffset[idx] = entries[idx].mOffset;
++                header.fragmentationLength[idx] = entries[idx].mSize;
++                LOG_V("NAL offset %" PRId64 " size %" PRId64, entries[idx].mOffset,
++                      entries[idx].mSize);
++              }
++              break;
++            }
++            case webrtc::VideoCodecType::kVideoCodecVP8:
++              mCodecSpecific.codecSpecific.VP8.pictureId = mPictureId++ & 0x7fff;
++              header.VerifyAndAllocateFragmentationHeader(1);
++              header.fragmentationOffset[0] = 0;
++              header.fragmentationLength[0] = image._length;
++              header.fragmentationPlType[0] = 0;
++              header.fragmentationTimeDiff[0] = 0;
++              break;
++            case webrtc::VideoCodecType::kVideoCodecVP9:
++              mCodecSpecific.codecSpecific.VP9.picture_id = mPictureId++ & 0x7fff;
++              mCodecSpecific.codecSpecific.VP9.tl0_pic_idx = mTl0PicIdx++;
++              mCodecSpecific.codecSpecific.VP9.gof_idx = mGofIdx++ % mGof.num_frames_in_gof;
++              mCodecSpecific.codecSpecific.VP9.inter_pic_predicted = !frame->mKeyframe;
++              mCodecSpecific.codecSpecific.VP9.ss_data_available = frame->mKeyframe;
++              if (mCodecSpecific.codecSpecific.VP9.ss_data_available) {
++                mCodecSpecific.codecSpecific.VP9.spatial_layer_resolution_present = true;
++                mCodecSpecific.codecSpecific.VP9.width[0] = displaySize.width;
++                mCodecSpecific.codecSpecific.VP9.height[0] = displaySize.height;
++                mCodecSpecific.codecSpecific.VP9.gof.CopyGofInfoVP9(mGof);
++              } else {
++                mCodecSpecific.codecSpecific.VP9.spatial_layer_resolution_present = true;
++              }
++              header.VerifyAndAllocateFragmentationHeader(1);
++              header.fragmentationOffset[0] = 0;
++              header.fragmentationLength[0] = image._length;
++              header.fragmentationPlType[0] = 0;
++              header.fragmentationTimeDiff[0] = 0;
++              break;
++            default:
++              MOZ_ASSERT(false, "Unknown codec");
++              break;
+           }
+ 
+-          webrtc::CodecSpecificInfo codecSpecific;
+-          codecSpecific.codecType = webrtc::kVideoCodecH264;
+-          codecSpecific.codecSpecific.H264.packetization_mode = mMode;
+-
+           LOG_V("Send encoded image");
+-          self->mCallback->OnEncodedImage(image, &codecSpecific, &header);
++          self->mCallback->OnEncodedImage(image, &mCodecSpecific, &header);
+           self->mBitrateAdjuster.Update(image._size);
+         }
+       },
+diff --git a/media/webrtc/signaling/src/media-conduit/WebrtcMediaDataEncoderCodec.h b/media/webrtc/signaling/src/media-conduit/WebrtcMediaDataEncoderCodec.h
+index 97c239cf9ad0..5bf3de92e52b 100644
+--- a/media/webrtc/signaling/src/media-conduit/WebrtcMediaDataEncoderCodec.h
++++ b/media/webrtc/signaling/src/media-conduit/WebrtcMediaDataEncoderCodec.h
+@@ -64,6 +64,12 @@ class WebrtcMediaDataEncoder : public RefCountedWebrtcVideoEncoder {
+   uint32_t mMaxFrameRate;
+   uint32_t mMinBitrateBps;
+   uint32_t mMaxBitrateBps;
++  webrtc::VideoCodecType mCodecType;
++  webrtc::CodecSpecificInfo mCodecSpecific;
++  uint16_t mPictureId;
++  webrtc::GofInfoVP9 mGof;
++  uint16_t mGofIdx;
++  uint8_t mTl0PicIdx;
+ };
+ 
+ }  // namespace mozilla
+diff --git a/modules/libpref/init/StaticPrefList.yaml b/modules/libpref/init/StaticPrefList.yaml
+index e9ba54aa8d3f..31e8182a2fed 100644
+--- a/modules/libpref/init/StaticPrefList.yaml
++++ b/modules/libpref/init/StaticPrefList.yaml
+@@ -7282,7 +7282,7 @@
+ 
+ - name: media.webrtc.platformencoder
+   type: bool
+-#if defined(MOZ_WIDGET_ANDROID)
++#if defined(MOZ_WIDGET_ANDROID) || defined(MOZ_EMBEDLITE)
+   value: true
+ #else
+   value: false
+-- 
+2.17.1
+
