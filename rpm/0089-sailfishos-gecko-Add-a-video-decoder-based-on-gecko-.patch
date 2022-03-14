@@ -1,18 +1,18 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Denis Grigorev <d.grigorev@omprussia.ru>
 Date: Thu, 16 Dec 2021 19:10:25 +0300
-Subject: [PATCH] [sailfishos][gecko] Add a video decoder based on gecko-camera. JB#56755
+Subject: [PATCH] Add a video decoder based on gecko-camera. JB#56755
 
 ---
  dom/media/platforms/PDMFactory.cpp            |  13 +
  .../gecko-camera/GeckoCameraDecoderModule.cpp |  57 ++++
  .../gecko-camera/GeckoCameraDecoderModule.h   |  44 +++
- .../gecko-camera/GeckoCameraVideoDecoder.cpp  | 299 ++++++++++++++++++
- .../gecko-camera/GeckoCameraVideoDecoder.h    |  88 ++++++
+ .../gecko-camera/GeckoCameraVideoDecoder.cpp  | 303 ++++++++++++++++++
+ .../gecko-camera/GeckoCameraVideoDecoder.h    |  89 +++++
  dom/media/platforms/moz.build                 |  11 +
  modules/libpref/init/StaticPrefList.yaml      |  13 +
  toolkit/moz.configure                         |   7 +
- 8 files changed, 532 insertions(+)
+ 8 files changed, 537 insertions(+)
  create mode 100644 dom/media/platforms/gecko-camera/GeckoCameraDecoderModule.cpp
  create mode 100644 dom/media/platforms/gecko-camera/GeckoCameraDecoderModule.h
  create mode 100644 dom/media/platforms/gecko-camera/GeckoCameraVideoDecoder.cpp
@@ -171,10 +171,10 @@ index 000000000000..cedfd3069668
 +#endif  // mozilla_GeckoCameraDecoderModule_h
 diff --git a/dom/media/platforms/gecko-camera/GeckoCameraVideoDecoder.cpp b/dom/media/platforms/gecko-camera/GeckoCameraVideoDecoder.cpp
 new file mode 100644
-index 000000000000..24fc6c421497
+index 000000000000..83dea155f2ec
 --- /dev/null
 +++ b/dom/media/platforms/gecko-camera/GeckoCameraVideoDecoder.cpp
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,303 @@
 +/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim:set ts=2 sw=2 sts=2 et cindent: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -190,8 +190,8 @@ index 000000000000..24fc6c421497
 +#include "VPXDecoder.h"
 +#include "VideoUtils.h"
 +
-+#define LOG(...) DDMOZ_LOG(sPDMLog, mozilla::LogLevel::Debug, __VA_ARGS__)
-+#define LOGEX(_this, ...) \
++#define VDEC_LOG(...) DDMOZ_LOG(sPDMLog, mozilla::LogLevel::Debug, __VA_ARGS__)
++#define VDEC_LOGEX(_this, ...) \
 +  DDMOZ_LOGEX(_this, sPDMLog, mozilla::LogLevel::Debug, __VA_ARGS__)
 +
 +namespace mozilla {
@@ -217,7 +217,11 @@ index 000000000000..24fc6c421497
 +      mDecodeTimer(new MediaTimer()),
 +      mCommandTaskQueue(CreateMediaDecodeTaskQueue("GeckoCameraVideoDecoder")) {
 +  MOZ_COUNT_CTOR(GeckoCameraVideoDecoder);
-+  LOG("GeckoCameraVideoDecoder - mMaxRefFrames=%d", mMaxRefFrames);
++  VDEC_LOG("GeckoCameraVideoDecoder - mMaxRefFrames=%d", mMaxRefFrames);
++}
++
++GeckoCameraVideoDecoder::~GeckoCameraVideoDecoder() {
++  MOZ_COUNT_DTOR(GeckoCameraVideoDecoder);
 +}
 +
 +RefPtr<MediaDataDecoder::InitPromise> GeckoCameraVideoDecoder::Init() {
@@ -231,7 +235,7 @@ index 000000000000..24fc6c421497
 +RefPtr<ShutdownPromise> GeckoCameraVideoDecoder::Shutdown() {
 +  RefPtr<GeckoCameraVideoDecoder> self = this;
 +  return InvokeAsync(mTaskQueue, __func__, [this, self]() {
-+      LOG("Shutdown");
++      VDEC_LOG("Shutdown");
 +      mIsShutDown = true;
 +      mDecoder->stop();
 +      mDecoder.reset();
@@ -243,7 +247,7 @@ index 000000000000..24fc6c421497
 +
 +RefPtr<MediaDataDecoder::DecodePromise> GeckoCameraVideoDecoder::Decode(
 +    MediaRawData* aSample) {
-+  LOG("mp4 input sample %p pts %lld duration %lld us%s %zu bytes", aSample,
++  VDEC_LOG("mp4 input sample %p pts %lld duration %lld us%s %zu bytes", aSample,
 +      aSample->mTime.ToMicroseconds(), aSample->mDuration.ToMicroseconds(),
 +      aSample->mKeyframe ? " keyframe" : "", aSample->Size());
 +
@@ -260,7 +264,7 @@ index 000000000000..24fc6c421497
 +            // the decoder pool. gecko-camera must handle this without issue.
 +            mCommandTaskQueue, __func__,
 +            [self = RefPtr<GeckoCameraVideoDecoder>(this), this]() {
-+              LOG("Decode is blocked for too long");
++              VDEC_LOG("Decode is blocked for too long");
 +              mError = true;
 +              mDecoder->drain();
 +            },
@@ -274,7 +278,7 @@ index 000000000000..24fc6c421497
 +RefPtr<MediaDataDecoder::DecodePromise> GeckoCameraVideoDecoder::Drain() {
 +  RefPtr<GeckoCameraVideoDecoder> self = this;
 +  return InvokeAsync(mTaskQueue, __func__, [self, this] {
-+    LOG("Drain");
++    VDEC_LOG("Drain");
 +    mDecoder->drain();
 +
 +    MutexAutoLock lock(mMutex);
@@ -289,7 +293,7 @@ index 000000000000..24fc6c421497
 +RefPtr<MediaDataDecoder::FlushPromise> GeckoCameraVideoDecoder::Flush() {
 +  RefPtr<GeckoCameraVideoDecoder> self = this;
 +  return InvokeAsync(mTaskQueue, __func__, [self, this] {
-+    LOG("Flush");
++    VDEC_LOG("Flush");
 +    mDecoder->flush();
 +    MutexAutoLock lock(mMutex);
 +    mReorderQueue.Clear();
@@ -309,10 +313,10 @@ index 000000000000..24fc6c421497
 +void GeckoCameraVideoDecoder::onDecodedYCbCrFrame(const gecko::camera::YCbCrFrame *frame) {
 +  MOZ_ASSERT(frame, "YCbCrFrame is null");
 +
-+  LOG("onDecodedFrame %llu", frame->timestampUs);
++  VDEC_LOG("onDecodedFrame %llu", frame->timestampUs);
 +
 +  if (mIsShutDown) {
-+    LOG("Decoder shuts down");
++    VDEC_LOG("Decoder shuts down");
 +    return;
 +  }
 +
@@ -321,7 +325,7 @@ index 000000000000..24fc6c421497
 +    MutexAutoLock lock(mMutex);
 +    auto iter = mInputFrames.find(frame->timestampUs);
 +    if (iter == mInputFrames.end()) {
-+      LOG("Couldn't find input frame with timestamp %llu", frame->timestampUs);
++      VDEC_LOG("Couldn't find input frame with timestamp %llu", frame->timestampUs);
 +      return;
 +    }
 +    inputFrame = iter->second;
@@ -378,12 +382,12 @@ index 000000000000..24fc6c421497
 +}
 +
 +void GeckoCameraVideoDecoder::onDecoderError(std::string errorDescription) {
-+  LOG("Decoder error %s", errorDescription.c_str());
++  VDEC_LOG("Decoder error %s", errorDescription.c_str());
 +  mError = true;
 +}
 +
 +void GeckoCameraVideoDecoder::onDecoderEOS() {
-+  LOG("Decoder EOS");
++  VDEC_LOG("Decoder EOS");
 +}
 +
 +gecko::codec::CodecType GeckoCameraVideoDecoder::CodecTypeFromMime(
@@ -415,13 +419,13 @@ index 000000000000..24fc6c421497
 +  }
 +
 +  if (!mCodecManager->createVideoDecoder(metadata.codecType, mDecoder)) {
-+    LOG("Cannot create decoder");
++    VDEC_LOG("Cannot create decoder");
 +    return MediaResult(NS_ERROR_DOM_MEDIA_FATAL_ERR,
 +                       RESULT_DETAIL("Create decoder failed"));
 +  }
 +
 +  if (!mDecoder->init(metadata)) {
-+    LOG("Cannot initialize decoder");
++    VDEC_LOG("Cannot initialize decoder");
 +    return MediaResult(NS_ERROR_DOM_MEDIA_FATAL_ERR,
 +                       RESULT_DETAIL("Init decoder failed"));
 +  }
@@ -456,15 +460,15 @@ index 000000000000..24fc6c421497
 +      aSample->mKeyframe ? gecko::codec::KeyFrame : gecko::codec::DeltaFrame,
 +      nullptr, nullptr);
 +  if (!ok) {
-+    LOG("Couldn't pass frame to decoder");
++    VDEC_LOG("Couldn't pass frame to decoder");
 +    NS_WARNING("Couldn't pass frame to decoder");
 +    mDecodePromise.Reject(NS_ERROR_DOM_MEDIA_DECODE_ERR, __func__);
 +    return;
 +  }
-+  LOG("The frame %lld sent to the decoder", aSample->mTime.ToMicroseconds());
++  VDEC_LOG("The frame %lld sent to the decoder", aSample->mTime.ToMicroseconds());
 +
 +  MutexAutoLock lock(mMutex);
-+  LOG("%llu decoded frames queued",
++  VDEC_LOG("%llu decoded frames queued",
 +      static_cast<unsigned long long>(mReorderQueue.Length()));
 +  DecodedData results;
 +  while (mReorderQueue.Length() > mMaxRefFrames) {
@@ -476,10 +480,10 @@ index 000000000000..24fc6c421497
 +}  // namespace mozilla
 diff --git a/dom/media/platforms/gecko-camera/GeckoCameraVideoDecoder.h b/dom/media/platforms/gecko-camera/GeckoCameraVideoDecoder.h
 new file mode 100644
-index 000000000000..17e26b24b705
+index 000000000000..a582d2388658
 --- /dev/null
 +++ b/dom/media/platforms/gecko-camera/GeckoCameraVideoDecoder.h
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,89 @@
 +/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim:set ts=2 sw=2 sts=2 et cindent: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -509,6 +513,7 @@ index 000000000000..17e26b24b705
 + public:
 +  GeckoCameraVideoDecoder(gecko::codec::CodecManager* manager,
 +      const CreateDecoderParams& aParams);
++  ~GeckoCameraVideoDecoder();
 +
 +  RefPtr<InitPromise> Init() override;
 +
